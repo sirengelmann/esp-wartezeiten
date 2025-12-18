@@ -1,0 +1,13 @@
+menu "Wi-Fi Einstellungen"
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+          SSID des WLANs für STA.
+
+    config WIFI_PASSWORD
+        string "Wi-Fi Passwort"
+        default ""
+        help
+          Passwort des WLANs für STA (leer für open).
+endmenu

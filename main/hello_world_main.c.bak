@@ -1,0 +1,325 @@
+/*
+ * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-License-Identifier: CC0-1.0
+ */
+
+#include <stdio.h>
+#include <inttypes.h>
+#include <string.h>
+#include <stdlib.h>
+#include <strings.h>   // strcasecmp
+#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"   // HTTPS-Zertifikatsbundle
+#include "cJSON.h"
+
+static const char *TAG = "wartezeiten";
+
+#define API_URL   "https://api.wartezeiten.app/v1/waitingtimes"
+#define PARK_ID   "30816cc0-aedb-4bfc-a180-b269a3a2f31d"
+#define LANGUAGE  "de"
+#define TARGET_RIDE_NAME "Voltron Nevera"
+
+// Handles
+static TaskHandle_t s_web_task_handle = NULL;
+static QueueHandle_t s_data_queue;
+
+// --- Eventhandler WLAN/IP ---
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        if (s_web_task_handle) {
+            xTaskNotifyGive(s_web_task_handle); // "await wifi" erfüllen
+        }
+    }
+}
+
+// ------------ HTTP Event-Handler + Buffer ------------
+typedef struct {
+    char *buf;
+    int   cap;
+    int   len;
+} http_buf_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    http_buf_t *hb = (http_buf_t*)evt->user_data; // von config.user_data
+    switch (evt->event_id) {
+        case HTTP_EVENT_ON_DATA:
+            if (!hb || evt->data_len <= 0) break;
+            // Buffer vergrößern falls nötig
+            if (hb->len + evt->data_len + 1 > hb->cap) {
+                int newcap = hb->cap ? hb->cap * 2 : 2048; // exponenzielle Erweiterung
+                while (newcap < hb->len + evt->data_len + 1) newcap *= 2;
+                char *nb = realloc(hb->buf, newcap);
+                if (!nb) return ESP_ERR_NO_MEM;
+                hb->buf = nb; hb->cap = newcap;
+            }
+            memcpy(hb->buf + hb->len, evt->data, evt->data_len);
+            hb->len += evt->data_len;
+            hb->buf[hb->len] = '\0';
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+// -----------------------------------------------------
+typedef enum {
+    COASTER_OPENED = 0,
+    COASTER_VIRTUALQUEUE = 1,
+    COASTER_MAINTENANCE = 2,
+    COASTER_CLOSED_ICE = 3,
+    COASTER_CLOSED_WEATHER = 4,
+    COASTER_CLOSED = 5,
+    COASTER_UNKNOWN = -1  // Fallback
+} coaster_status_t;
+
+static coaster_status_t coaster_status_from_string(const char *s)
+{
+    if      (!strcasecmp(s, "open"))           return COASTER_OPENED;
+    else if (!strcasecmp(s, "virtualqueue"))   return COASTER_VIRTUALQUEUE;
+    else if (!strcasecmp(s, "maintenance"))    return COASTER_MAINTENANCE;
+    else if (!strcasecmp(s, "closedice"))      return COASTER_CLOSED_ICE;
+    else if (!strcasecmp(s, "closedweather"))  return COASTER_CLOSED_WEATHER;
+    else if (!strcasecmp(s, "closed"))         return COASTER_CLOSED;
+    else                                       return COASTER_UNKNOWN;
+}
+
+static const char* coaster_status_to_string(coaster_status_t status)
+{
+    switch (status) {
+        case COASTER_OPENED:          return "Geöffnet";
+        case COASTER_VIRTUALQUEUE:    return "Virtuelle Warteschlange";
+        case COASTER_MAINTENANCE:     return "Wartung";
+        case COASTER_CLOSED_ICE:      return "Geschlossen (Eis)";
+        case COASTER_CLOSED_WEATHER:  return "Geschlossen (Wetter)";
+        case COASTER_CLOSED:          return "Geschlossen";
+        case COASTER_UNKNOWN:
+        default:                      return "Unbekannt";
+    }
+}
+
+typedef struct {
+    int                 waitingtime;
+    coaster_status_t    status;
+    char*               name;
+} coaster_data_t;
+
+static bool json_populate_coaster_data(cJSON* ride, coaster_data_t* coaster_data )
+{
+    if (!coaster_data)
+        return false;
+
+    cJSON* item_waitingtime = cJSON_GetObjectItem(ride, "waitingtime");
+    cJSON* item_status = cJSON_GetObjectItem(ride, "status");
+    cJSON* item_name = cJSON_GetObjectItem(ride, "name");
+
+    if (cJSON_IsNumber(item_waitingtime))
+        coaster_data->waitingtime = item_waitingtime->valueint;
+
+    if (cJSON_IsString(item_status))
+        coaster_data->status = coaster_status_from_string(item_status->valuestring);
+    else
+        coaster_data->status = COASTER_UNKNOWN;
+
+    if (cJSON_IsString(item_name))
+    {
+        if (!coaster_data->name)
+        {
+            coaster_data->name = (char*) malloc( strlen(item_name->valuestring) + 1 );
+            if (!coaster_data->name)
+                return false;
+        }   
+        else if (strlen(coaster_data->name) != strlen(item_name->valuestring))
+        {
+            coaster_data->name = (char*) realloc( (void*) coaster_data->name, strlen(item_name->valuestring) + 1 );
+            if (!coaster_data->name)
+                return false;
+        }
+            
+        
+        memcpy ( (void*) coaster_data->name, (const void *) item_name->valuestring, strlen(item_name->valuestring) + 1 );
+    }
+        
+    return true;
+}
+
+static cJSON* json_find_item_by_name(cJSON *root, const char *name)
+{
+    cJSON *arr = NULL;
+    if (cJSON_IsArray(root)) {
+        arr = root;
+    } else if (cJSON_IsObject(root)) {
+        arr = cJSON_GetObjectItem(root, "data");
+        if (!cJSON_IsArray(arr)) arr = cJSON_GetObjectItem(root, "items");
+        if (!cJSON_IsArray(arr)) arr = cJSON_GetObjectItem(root, "results");
+        if (!cJSON_IsArray(arr)) {
+            cJSON *nm = cJSON_GetObjectItem(root, "name");
+            if (cJSON_IsString(nm) && strcasecmp(nm->valuestring, name) == 0) return root;
+        }
+    }
+    if (!cJSON_IsArray(arr)) return NULL;
+
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, arr) {
+        if (!cJSON_IsObject(it)) continue;
+        cJSON *nm = cJSON_GetObjectItem(it, "name");
+        if (!cJSON_IsString(nm)) nm = cJSON_GetObjectItem(it, "rideName");
+        if (!cJSON_IsString(nm)) nm = cJSON_GetObjectItem(it, "title");
+        if (cJSON_IsString(nm) && strcasecmp(nm->valuestring, name) == 0) {
+            return it;
+        }
+    }
+    return NULL;
+}
+
+// --- Web-Task: wartet auf Wi-Fi, holt API (chunked-fähig), sendet Zahl in Queue ---
+static void web_task(void *arg)
+{
+    // „await Wi-Fi/IP“
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20000)) == 0) {
+        ESP_LOGE(TAG, "Timeout: keine Wi-Fi Verbindung");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Starte API-Request: %s", API_URL);
+
+    http_buf_t hb = {0};
+
+    esp_http_client_config_t cfg = {
+        .url = API_URL,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach, // sauberes HTTPS
+        .event_handler = http_event_handler,
+        .user_data = &hb,
+        .keep_alive_enable = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "esp_http_client_init fehlgeschlagen");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Header wie im curl:
+    esp_http_client_set_header(client, "accept", "application/json");
+    esp_http_client_set_header(client, "park", PARK_ID);
+    esp_http_client_set_header(client, "language", LANGUAGE);
+    // gzip vermeiden → vereinfacht Parsing/Debug
+    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    esp_http_client_set_header(client, "User-Agent", "esp32s3-wartezeiten/1.0");
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "HTTP Status=%d, empfangen=%d Bytes", status, hb.len);
+
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300 || hb.len <= 0) {
+        ESP_LOGE(TAG, "HTTP fehlgeschlagen: %s, len=%d", esp_err_to_name(err), hb.len);
+        free(hb.buf);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // JSON parsen und „Voltron Nevera“ finden
+    coaster_data_t* coaster_data = calloc(1, sizeof(coaster_data_t));
+
+    cJSON *root = cJSON_Parse(hb.buf);
+    if (root) {
+        cJSON *ride = json_find_item_by_name(root, TARGET_RIDE_NAME);
+        if (ride) {
+            (void)json_populate_coaster_data(ride, coaster_data);
+        } else {
+            ESP_LOGW(TAG, "Eintrag '%s' nicht gefunden.", TARGET_RIDE_NAME);
+        }
+        cJSON_Delete(root);
+    } else {
+        ESP_LOGE(TAG, "JSON parse error");
+    }
+
+    if (xQueueSend(s_data_queue, &coaster_data, pdMS_TO_TICKS(100)) != pdPASS) {
+        ESP_LOGW(TAG, "Queue voll, Wert nicht gesendet.");
+    }
+    
+
+    free(hb.buf);
+    vTaskDelete(NULL);
+}
+
+// --- Print-Task: gibt Wert aus Queue aus ---
+static void print_task(void *arg)
+{
+    coaster_data_t* coaster_data = NULL;
+    if (xQueueReceive(s_data_queue, &coaster_data, portMAX_DELAY) == pdTRUE) {
+        printf("Wartezeit Voltron Nevera: %d min\n", coaster_data->waitingtime);
+        printf("Status Voltron Nevera: %s\n", coaster_status_to_string(coaster_data->status));
+        printf("Name Voltron Nevera: %s\n", coaster_data->name);
+    } else {
+        printf("Fehler: nichts aus Queue empfangen.\n");
+    }
+    vTaskDelete(NULL);
+}
+
+// --- app_main ---
+void app_main(void)
+{
+    // 1) NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+    // 2) Netz & Event-Loop
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    // 3) STA-Interface
+    esp_netif_create_default_wifi_sta();
+    // 4) Wi-Fi init + Events
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                        ESP_EVENT_ANY_ID, &event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                        IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL));
+
+    // 5) Wi-Fi Konfig
+    wifi_config_t wifi_cfg = { 0 };
+    strcpy((char*)wifi_cfg.sta.ssid,     "PandaLAN");
+    strcpy((char*)wifi_cfg.sta.password, "EngelMaus2606");
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_UNSPECIFIED;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+
+    printf("Hello world!\n");
+
+    // 6) IPC vorbereiten und Tasks starten (vor dem Wi-Fi-Start, um Race zu vermeiden)
+    s_data_queue = xQueueCreate(1, sizeof(coaster_data_t*));
+    configASSERT(s_data_queue != NULL);
+
+    xTaskCreate(print_task, "print_task", 4096, NULL, 5, NULL);
+    xTaskCreate(web_task,   "web_task",   8192, NULL, 5, &s_web_task_handle);
+
+    // 7) Wi-Fi starten -> Events feuern, web_task wird benachrichtigt
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
