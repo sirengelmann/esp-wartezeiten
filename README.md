@@ -1,5 +1,7 @@
 # ESP Wartezeiten E-Paper Display (ESP32-S3)
 
+Created as a Christmas gift.
+
 Battery-friendly ESP32 app that fetches Europa-Park ride wait and opening times, renders them on a 1.54" e-paper, and deep-sleeps between updates. Wake cycles are driven by an external RTC alarm; the device adapts its wake interval depending on park/coaster status and performs a daily time refresh to handle drift and DST.
 
 > Built with the help of AI.
@@ -52,3 +54,7 @@ If the card/file/keys are missing, the app uses the Wi‑Fi credentials set in m
 6. Enter deep sleep.
 
 Enjoy fast, low-power updates on your e-paper display!***
+
+## Credits & Disclaimer
+- Wait time data provided by [api.wartezeiten.app](https://api.wartezeiten.app) — check it out!
+- Logos/branding are displayed for personal, non-commercial use; no copyright infringement intended. If there is any issue, please contact me and I will address it.
