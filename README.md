@@ -1,53 +1,49 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# ESP Wartezeiten E-Paper Display
 
-# Hello World Example
+Battery-friendly ESP32 app that fetches Europa-Park ride wait and opening times, renders them on a 1.54" e-paper, and deep-sleeps between updates. Wake cycles are driven by an external RTC alarm; the device adapts its wake interval depending on park/coaster status and performs a daily time refresh to handle drift and DST.
 
-Starts a FreeRTOS task to print "Hello World".
+> Built with the help of AI.
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+## Features
+- Fetches waiting times and opening hours via HTTPS APIs (cert bundle provided by ESP-IDF).
+- Renders status and wait time to a 1.54" e-paper (LVGL, 1 bpp).
+- External RTC (PCF85263A) sets alarms for short polling (default 1 minute) during open hours, and sleeps longer when park/coaster are closed (refresh wake at configurable 04:00).
+- Wakes on RTC alert pin (GPIO7), resyncs time via SNTP on refresh wakes, and writes time back to RTC.
+- Loads Wi‑Fi credentials from `config.txt` on SD card (falls back to menuconfig credentials). SD power is switched on/off via GPIO2; card detect is active low on GPIO47.
 
-## How to use example
+## Hardware Notes
+- Board: ESP32 (LVGL + e-paper display on GPIO1 power enable).
+- RTC alert/wake: GPIO7 (active low, ext0).
+- SD card (SDMMC, 4-bit): CLK IO39, CMD IO40, D0 IO38, D1 IO48, D2 IO42, D3 IO41; card detect on IO47 (active low); SD power enable on IO2.
+- Default wake intervals: 0h 1min during open hours; daily refresh at 04:00 (configurable in `main.c`).
 
-Follow detailed instructions provided specifically for this example.
-
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
+## SD Card Wi‑Fi Config
+Place `config.txt` on the SD card root:
 ```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+WIFI_SSID=Your Network Name
+WIFI_PASS=Your Password
 ```
+If the card/file/keys are missing, the app uses the Wi‑Fi credentials set in menuconfig.
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+## Build & Flash
+- ESP-IDF project; typical workflow:
+  ```
+  idf.py set-target esp32
+  idf.py build
+  idf.py -p /dev/ttyUSB0 flash monitor
+  ```
+- Keep `sdkconfig` under version control if you want to share the exact menuconfig settings.
 
-## Troubleshooting
+## Repository Hints
+- Ignore build artifacts (`build/`, `sdkconfig.old`, `sdkconfig.ci`, logs); keep `sdkconfig` if desired.
+- Sources live in `main/`; dependencies are tracked via `dependencies.lock`/`managed_components/`.
 
-* Program upload failure
+## Behavior Overview
+1. Power/boot or RTC wake.
+2. (Cold boot) optional USB delay for flashing; load SD Wi‑Fi creds; init Wi‑Fi.
+3. Decide if this is a “refresh wake” (time-of-day match); run SNTP + write RTC when needed.
+4. Fetch API data; render to e-paper; signal completion.
+5. Choose next alarm based on park/coaster state: short interval while open, park-open time if before open, or next-day refresh time when closed.
+6. Enter deep sleep.
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+Enjoy fast, low-power updates on your e-paper display!***
